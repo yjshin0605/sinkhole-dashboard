@@ -4,13 +4,17 @@ import random
 import io
 import os
 import urllib.request
+from datetime import datetime, timedelta
 from fpdf import FPDF
 import folium
 from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 # ---------------------------------------------------------
-# 0. 한글 폰트 자동 설정 (PDF용)
+# 0. 초기 설정 (폰트 및 주소 변환기)
 # ---------------------------------------------------------
+@st.cache_resource
 def get_korean_font():
     font_path = "NanumGothic.ttf"
     if not os.path.exists(font_path):
@@ -20,6 +24,36 @@ def get_korean_font():
         except:
             st.error("폰트 다운로드 실패. PDF에서 한글이 깨질 수 있습니다.")
     return font_path
+
+# 주소 변환 함수 (캐싱하여 속도 향상)
+@st.cache_data(show_spinner=False)
+def get_address_batch(coords_list):
+    """
+    좌표 리스트를 받아 주소 리스트로 변환합니다.
+    """
+    geolocator = Nominatim(user_agent="void_detection_demo_v2")
+    geocode = RateLimiter(geolocator.reverse, min_delay_seconds=0.1)
+    
+    addresses = []
+    progress_bar = st.progress(0, text="좌표를 주소로 변환 중입니다...")
+    
+    for i, (lat, lon) in enumerate(coords_list):
+        try:
+            location = geocode((lat, lon), language='ko', timeout=5)
+            if location:
+                addr = location.address.replace("대한민국", "").strip()
+                if str(location.raw.get('address', {}).get('postcode')) in addr:
+                    addr = addr.replace(location.raw.get('address', {}).get('postcode'), "")
+                addresses.append(addr.strip(', '))
+            else:
+                addresses.append("주소 미확인")
+        except:
+            addresses.append("통신 오류")
+        
+        progress_bar.progress((i + 1) / len(coords_list))
+    
+    progress_bar.empty()
+    return addresses
 
 # ---------------------------------------------------------
 # 1. PDF 생성 클래스
@@ -37,6 +71,7 @@ class PDFReport(FPDF):
         self.set_font('NanumGothic', '', 8)
         self.cell(0, 10, f'Page {self.page_no()}', align='C')
 
+@st.cache_data
 def generate_pdf_report(df, summary_stats):
     get_korean_font()
     pdf = PDFReport()
@@ -62,16 +97,20 @@ def generate_pdf_report(df, summary_stats):
     pdf.set_font('NanumGothic', '', 10)
     pdf.set_fill_color(52, 152, 219)
     pdf.set_text_color(255, 255, 255)
-    col_widths = [15, 20, 35, 35, 35, 30] 
-    headers = ['Index', '위험도', '위도', '경도', '심도(m)', '너비(m)']
+    
+    # [PDF는 여전히 주소를 유지하여 가독성 확보]
+    col_widths = [15, 20, 85, 25, 25] 
+    headers = ['Index', '위험도', '위치 (주소)', '심도(m)', '너비(m)']
     for i, h in enumerate(headers):
         pdf.cell(col_widths[i], 10, h, align='C', fill=True)
     pdf.ln()
 
     pdf.set_text_color(0, 0, 0)
-    pdf.set_font('NanumGothic', '', 9)
     fill = False 
+    
     for index, row in df.iterrows():
+        pdf.set_font('NanumGothic', '', 9)
+        
         if row['위험도'] == '긴급':
             pdf.set_text_color(192, 57, 43)
         else:
@@ -80,19 +119,26 @@ def generate_pdf_report(df, summary_stats):
         
         pdf.cell(col_widths[0], 8, str(row['Index']), align='C', fill=fill)
         pdf.cell(col_widths[1], 8, str(row['위험도']), align='C', fill=fill)
-        pdf.cell(col_widths[2], 8, str(row['위도']), align='C', fill=fill)
-        pdf.cell(col_widths[3], 8, str(row['경도']), align='C', fill=fill)
-        pdf.cell(col_widths[4], 8, str(row['심도(m)']), align='C', fill=fill)
-        pdf.cell(col_widths[5], 8, str(row['너비(m)']), align='C', fill=fill)
+        
+        # 주소 출력
+        pdf.set_font('NanumGothic', '', 7)
+        pdf.cell(col_widths[2], 8, str(row['주소']), align='L', fill=fill)
+        pdf.set_font('NanumGothic', '', 9)
+
+        pdf.cell(col_widths[3], 8, str(row['심도(m)']), align='C', fill=fill)
+        pdf.cell(col_widths[4], 8, str(row['너비(m)']), align='C', fill=fill)
         pdf.ln()
         fill = not fill
-    return pdf.output()
+    
+    return bytes(pdf.output())
 
 # ---------------------------------------------------------
 # 2. 데이터 생성 함수
 # ---------------------------------------------------------
 def generate_mock_data(count=20):
     data = []
+    current_time = datetime.now()
+    
     for i in range(1, count + 1):
         width = round(random.uniform(0.3, 8.0), 2)
         if width > 4.0:
@@ -101,9 +147,14 @@ def generate_mock_data(count=20):
             risk = "우선"
         else:
             risk = "일반"
+        
+        random_hours = random.randint(0, 48)
+        random_minutes = random.randint(0, 59)
+        detection_time = current_time - timedelta(hours=random_hours, minutes=random_minutes)
 
         entry = {
             "index": i,
+            "timestamp": detection_time.strftime("%Y-%m-%d %H:%M"),
             "coordinates_3d": {
                 "latitude": 37.5665 + random.uniform(-0.02, 0.02),
                 "longitude": 126.9780 + random.uniform(-0.03, 0.03),
@@ -118,7 +169,7 @@ def generate_mock_data(count=20):
     return data
 
 # ---------------------------------------------------------
-# 3. 메인 앱 UI 및 데이터 처리
+# 3. 메인 앱 UI
 # ---------------------------------------------------------
 st.set_page_config(page_title="지하 공극 리포트", page_icon="🕳️", layout="wide")
 st.title("🕳️ 지하 공극(Sinkhole) 탐지 리포트")
@@ -126,19 +177,43 @@ st.title("🕳️ 지하 공극(Sinkhole) 탐지 리포트")
 if 'void_data' not in st.session_state:
     st.session_state['void_data'] = generate_mock_data()
 
+if 'address_map' not in st.session_state:
+    st.session_state['address_map'] = {}
+
 with st.sidebar:
-    st.header("⚙️ 설정")
+    st.header("⚙️ 데이터 관리")
     if st.button("🔄 새로운 데이터 생성", use_container_width=True):
         st.session_state['void_data'] = generate_mock_data()
+        st.session_state['address_map'] = {} 
         st.success("데이터가 갱신되었습니다!")
 
 data = st.session_state['void_data']
 
-# 데이터 가공
+# ---------------------------------------------------------
+# 4. 데이터 가공 및 주소 변환
+# ---------------------------------------------------------
+coords_to_fetch = []
+indices_to_fetch = []
+
+for item in data:
+    idx = item['index']
+    if idx not in st.session_state['address_map']:
+        coords_to_fetch.append((item['coordinates_3d']['latitude'], item['coordinates_3d']['longitude']))
+        indices_to_fetch.append(idx)
+
+if coords_to_fetch:
+    with st.spinner("좌표를 주소로 변환 중입니다... (최초 1회)"):
+        fetched_addresses = get_address_batch(coords_to_fetch)
+        for i, idx in enumerate(indices_to_fetch):
+            st.session_state['address_map'][idx] = fetched_addresses[i]
+
 flattened_data = []
 for item in data:
+    addr = st.session_state['address_map'].get(item['index'], "변환 중...")
     flattened_data.append({
         "Index": item['index'],
+        "탐지 일시": item['timestamp'],
+        "주소": addr, 
         "위험도": item['risk_level'],
         "위도": item['coordinates_3d']['latitude'],
         "경도": item['coordinates_3d']['longitude'],
@@ -154,7 +229,7 @@ summary = {
 }
 
 # ---------------------------------------------------------
-# 4. 지도 섹션 (높이 조절 및 공백 최소화)
+# 5. 지도 섹션
 # ---------------------------------------------------------
 st.subheader("🗺️ 탐지 위치 시각화 (Interactive Map)")
 
@@ -177,21 +252,23 @@ with col_map:
             color = 'green'
             icon = 'info-circle'
         
+        # 팝업에 주소 표시
         popup_html = f"""
-        <b>Index: {row['Index']}</b><br>
-        위험도: {row['위험도']}<br>
-        크기: {row['너비(m)']}m<br>
-        심도: {row['심도(m)']}m
+        <div style="width:150px">
+            <b>#{row['Index']} {row['위험도']}</b><br>
+            <span style="font-size:11px">{row['주소']}</span><br>
+            <hr style="margin:5px 0">
+            크기: {row['너비(m)']}m
+        </div>
         """
         
         folium.Marker(
             [row['위도'], row['경도']],
             popup=folium.Popup(popup_html, max_width=200),
-            tooltip=f"탐지 #{row['Index']} ({row['위험도']})",
+            tooltip=f"#{row['Index']} {row['주소'][:10]}...",
             icon=folium.Icon(color=color, icon=icon, prefix='fa'),
         ).add_to(m)
 
-    # [수정됨] 지도 높이를 500 -> 400으로 줄여서 공백을 줄임
     map_data = st_folium(m, width="100%", height=400, key="main_map")
 
 with col_detail:
@@ -208,29 +285,34 @@ with col_detail:
                 break
 
     if selected_void is not None:
-        st.success(f"**선택된 공극: #{int(selected_void['Index'])}**")
-        st.write(f"- **위험도:** {selected_void['위험도']}")
-        st.write(f"- **위도:** {selected_void['위도']}")
-        st.write(f"- **경도:** {selected_void['경도']}")
+        st.success(f"**#{int(selected_void['Index'])} {selected_void['위험도']}**")
+        st.info(f"📍 **{selected_void['주소']}**")
+        
+        # [수정됨] 상세 정보에 위도, 경도 다시 추가
+        st.write(f"- **위도:** {selected_void['위도']:.6f}")
+        st.write(f"- **경도:** {selected_void['경도']:.6f}")
+        st.write(f"- **일시:** {selected_void['탐지 일시']}")
         st.write(f"- **심도:** {selected_void['심도(m)']} m")
         st.write(f"- **너비:** {selected_void['너비(m)']} m")
+        st.write(f"- **부피:** {round(selected_void['너비(m)'] * selected_void['너비(m)'] * 1.5, 2)} m³ (추정)")
     else:
-        st.info("지도에서 핀을 클릭해주세요.")
+        st.info("지도에서 핀을 클릭하여 상세 정보를 확인하세요.")
 
 st.divider()
 
 # ---------------------------------------------------------
-# 5. 데이터 목록 및 다운로드 (오류 수정됨)
+# 6. 데이터 목록 및 다운로드
 # ---------------------------------------------------------
 st.subheader("📋 전체 탐지 데이터 목록")
-st.dataframe(df, use_container_width=True, height=300)
+
+# [수정됨] 목록에서 '주소' 제외하고 '위도', '경도' 추가
+cols_for_table = ['Index', '위험도', '위도', '경도', '탐지 일시', '심도(m)', '너비(m)']
+st.dataframe(df[cols_for_table], use_container_width=True, height=300)
 
 col_stats, col_download = st.columns([1, 1])
 
 with col_stats:
     st.markdown("##### 📊 요약 통계")
-    # [수정됨] st.info 오류 해결 -> st.markdown 사용
-    # HTML을 사용하기 위해 st.markdown으로 변경하고 스타일을 직접 적용했습니다.
     st.markdown(f"""
     <div style="padding:10px; border-radius:5px; background-color:#f0f2f6; border:1px solid #e6e9ef;">
         <strong>총 발견 수:</strong> {summary['total']}건<br>
@@ -241,15 +323,22 @@ with col_stats:
 
 with col_download:
     st.markdown("##### 💾 리포트 다운로드")
-    csv_data = df.to_csv(index=False).encode('utf-8-sig')
+    
+    # [수정됨] CSV 다운로드 시 '주소' 컬럼 제외 (화면에 보이는 표와 동일하게 설정)
+    csv_data = df[cols_for_table].to_csv(index=False).encode('utf-8-sig')
     st.download_button("📄 CSV로 받기", csv_data, "report.csv", "text/csv", use_container_width=True)
     
-    st.write("") 
-    if st.button("📕 PDF 리포트 생성", type="primary", use_container_width=True):
-        with st.spinner('PDF 생성 중...'):
-            try:
-                pdf_bytes = generate_pdf_report(df, summary)
-                st.download_button("📥 PDF 다운로드", bytes(pdf_bytes), "void_report.pdf", "application/pdf", use_container_width=True, key="pdf-download-2")
-                st.success("완료!")
-            except Exception as e:
-                st.error(f"오류: {e}")
+    st.write("")
+    
+    try:
+        pdf_bytes = generate_pdf_report(df, summary)
+        st.download_button(
+            label="📥 PDF로 받기",
+            data=pdf_bytes,
+            file_name="void_report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            type="primary"
+        )
+    except Exception as e:
+        st.error(f"PDF 생성 오류: {e}")
