@@ -25,17 +25,18 @@ def get_korean_font():
             st.error("폰트 다운로드 실패. PDF에서 한글이 깨질 수 있습니다.")
     return font_path
 
-# 주소 변환 함수 (캐싱하여 속도 향상)
+# 주소 변환 함수 (이제 PDF 생성 시에만 호출됨)
 @st.cache_data(show_spinner=False)
 def get_address_batch(coords_list):
     """
     좌표 리스트를 받아 주소 리스트로 변환합니다.
     """
-    geolocator = Nominatim(user_agent="void_detection_demo_v2")
+    geolocator = Nominatim(user_agent="void_detection_demo_v3")
     geocode = RateLimiter(geolocator.reverse, min_delay_seconds=0.1)
     
     addresses = []
-    progress_bar = st.progress(0, text="좌표를 주소로 변환 중입니다...")
+    # PDF 생성 중에만 프로그레스 바가 뜹니다.
+    progress_bar = st.progress(0, text="PDF용 주소 변환 중... (잠시만 기다려주세요)")
     
     for i, (lat, lon) in enumerate(coords_list):
         try:
@@ -71,9 +72,14 @@ class PDFReport(FPDF):
         self.set_font('NanumGothic', '', 8)
         self.cell(0, 10, f'Page {self.page_no()}', align='C')
 
-@st.cache_data
+# [변경됨] PDF 생성 함수 안에서 주소 변환을 수행합니다.
 def generate_pdf_report(df, summary_stats):
     get_korean_font()
+    
+    # 1. PDF 생성을 위한 주소 변환 시작 (여기서 시간이 소요됨)
+    coords = list(zip(df['위도'], df['경도']))
+    address_list = get_address_batch(coords)
+    
     pdf = PDFReport()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -98,7 +104,6 @@ def generate_pdf_report(df, summary_stats):
     pdf.set_fill_color(52, 152, 219)
     pdf.set_text_color(255, 255, 255)
     
-    # [PDF는 여전히 주소를 유지하여 가독성 확보]
     col_widths = [15, 20, 85, 25, 25] 
     headers = ['Index', '위험도', '위치 (주소)', '심도(m)', '너비(m)']
     for i, h in enumerate(headers):
@@ -108,7 +113,8 @@ def generate_pdf_report(df, summary_stats):
     pdf.set_text_color(0, 0, 0)
     fill = False 
     
-    for index, row in df.iterrows():
+    # 데이터 프레임과 변환된 주소 리스트를 매칭하여 출력
+    for i, (index, row) in enumerate(df.iterrows()):
         pdf.set_font('NanumGothic', '', 9)
         
         if row['위험도'] == '긴급':
@@ -120,9 +126,11 @@ def generate_pdf_report(df, summary_stats):
         pdf.cell(col_widths[0], 8, str(row['Index']), align='C', fill=fill)
         pdf.cell(col_widths[1], 8, str(row['위험도']), align='C', fill=fill)
         
-        # 주소 출력
+        # 여기서 변환된 주소를 사용합니다!
+        current_address = address_list[i]
+        
         pdf.set_font('NanumGothic', '', 7)
-        pdf.cell(col_widths[2], 8, str(row['주소']), align='L', fill=fill)
+        pdf.cell(col_widths[2], 8, current_address, align='L', fill=fill)
         pdf.set_font('NanumGothic', '', 9)
 
         pdf.cell(col_widths[3], 8, str(row['심도(m)']), align='C', fill=fill)
@@ -177,43 +185,20 @@ st.title("🕳️ 지하 공극(Sinkhole) 탐지 리포트")
 if 'void_data' not in st.session_state:
     st.session_state['void_data'] = generate_mock_data()
 
-if 'address_map' not in st.session_state:
-    st.session_state['address_map'] = {}
-
 with st.sidebar:
     st.header("⚙️ 데이터 관리")
     if st.button("🔄 새로운 데이터 생성", use_container_width=True):
         st.session_state['void_data'] = generate_mock_data()
-        st.session_state['address_map'] = {} 
         st.success("데이터가 갱신되었습니다!")
 
 data = st.session_state['void_data']
 
-# ---------------------------------------------------------
-# 4. 데이터 가공 및 주소 변환
-# ---------------------------------------------------------
-coords_to_fetch = []
-indices_to_fetch = []
-
-for item in data:
-    idx = item['index']
-    if idx not in st.session_state['address_map']:
-        coords_to_fetch.append((item['coordinates_3d']['latitude'], item['coordinates_3d']['longitude']))
-        indices_to_fetch.append(idx)
-
-if coords_to_fetch:
-    with st.spinner("좌표를 주소로 변환 중입니다... (최초 1회)"):
-        fetched_addresses = get_address_batch(coords_to_fetch)
-        for i, idx in enumerate(indices_to_fetch):
-            st.session_state['address_map'][idx] = fetched_addresses[i]
-
+# 데이터 가공 (주소 변환 없이 위도/경도만 사용 -> 속도 빠름)
 flattened_data = []
 for item in data:
-    addr = st.session_state['address_map'].get(item['index'], "변환 중...")
     flattened_data.append({
         "Index": item['index'],
         "탐지 일시": item['timestamp'],
-        "주소": addr, 
         "위험도": item['risk_level'],
         "위도": item['coordinates_3d']['latitude'],
         "경도": item['coordinates_3d']['longitude'],
@@ -229,7 +214,7 @@ summary = {
 }
 
 # ---------------------------------------------------------
-# 5. 지도 섹션
+# 4. 지도 섹션 (위도/경도 사용)
 # ---------------------------------------------------------
 st.subheader("🗺️ 탐지 위치 시각화 (Interactive Map)")
 
@@ -252,11 +237,12 @@ with col_map:
             color = 'green'
             icon = 'info-circle'
         
-        # 팝업에 주소 표시
+        # 팝업: 주소 대신 위도/경도 표시
         popup_html = f"""
         <div style="width:150px">
             <b>#{row['Index']} {row['위험도']}</b><br>
-            <span style="font-size:11px">{row['주소']}</span><br>
+            위도: {row['위도']:.4f}<br>
+            경도: {row['경도']:.4f}<br>
             <hr style="margin:5px 0">
             크기: {row['너비(m)']}m
         </div>
@@ -265,7 +251,7 @@ with col_map:
         folium.Marker(
             [row['위도'], row['경도']],
             popup=folium.Popup(popup_html, max_width=200),
-            tooltip=f"#{row['Index']} {row['주소'][:10]}...",
+            tooltip=f"#{row['Index']} {row['위험도']}",
             icon=folium.Icon(color=color, icon=icon, prefix='fa'),
         ).add_to(m)
 
@@ -286,9 +272,7 @@ with col_detail:
 
     if selected_void is not None:
         st.success(f"**#{int(selected_void['Index'])} {selected_void['위험도']}**")
-        st.info(f"📍 **{selected_void['주소']}**")
-        
-        # [수정됨] 상세 정보에 위도, 경도 다시 추가
+        # 상세 정보 패널: 주소 제거하고 위도/경도 표시
         st.write(f"- **위도:** {selected_void['위도']:.6f}")
         st.write(f"- **경도:** {selected_void['경도']:.6f}")
         st.write(f"- **일시:** {selected_void['탐지 일시']}")
@@ -301,11 +285,11 @@ with col_detail:
 st.divider()
 
 # ---------------------------------------------------------
-# 6. 데이터 목록 및 다운로드
+# 5. 데이터 목록 및 다운로드
 # ---------------------------------------------------------
 st.subheader("📋 전체 탐지 데이터 목록")
 
-# [수정됨] 목록에서 '주소' 제외하고 '위도', '경도' 추가
+# 테이블 컬럼: 주소 없음
 cols_for_table = ['Index', '위험도', '위도', '경도', '탐지 일시', '심도(m)', '너비(m)']
 st.dataframe(df[cols_for_table], use_container_width=True, height=300)
 
@@ -324,21 +308,24 @@ with col_stats:
 with col_download:
     st.markdown("##### 💾 리포트 다운로드")
     
-    # [수정됨] CSV 다운로드 시 '주소' 컬럼 제외 (화면에 보이는 표와 동일하게 설정)
+    # CSV 다운로드: 주소 없음 (빠름)
     csv_data = df[cols_for_table].to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📄 CSV로 받기", csv_data, "report.csv", "text/csv", use_container_width=True)
+    st.download_button("📄 CSV로 받기 (좌표)", csv_data, "report.csv", "text/csv", use_container_width=True)
     
     st.write("")
     
-    try:
-        pdf_bytes = generate_pdf_report(df, summary)
-        st.download_button(
-            label="📥 PDF로 받기",
-            data=pdf_bytes,
-            file_name="void_report.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-            type="primary"
-        )
-    except Exception as e:
-        st.error(f"PDF 생성 오류: {e}")
+    # PDF 생성 버튼: 이 버튼을 누를 때만 주소 변환 로직이 실행됨
+    if st.button("📕 PDF 리포트 생성 (주소 변환)", type="primary", use_container_width=True):
+        with st.spinner('좌표를 주소로 변환하여 PDF를 생성 중입니다... (약 10초 소요)'):
+            try:
+                pdf_bytes = generate_pdf_report(df, summary)
+                st.download_button(
+                    label="📥 PDF 다운로드 완료!",
+                    data=pdf_bytes,
+                    file_name="void_report.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="pdf-download-final"
+                )
+            except Exception as e:
+                st.error(f"오류 발생: {e}")
